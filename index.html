@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPTV Player</title>
+<script src="theme-init.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">//&nbsp;T-TV</div>
+  <div class="header-right">
+    <button type="button" class="theme-toggle" id="themeToggle">Bright page</button>
+  </div>
+</header>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-top">
+      <select class="filter-select" id="source-select" aria-label="Built-in playlist" disabled>
+        <option value="">Loading playlists…</option>
+      </select>
+
+      <button type="button" class="add-playlist-toggle" id="add-playlist-toggle">+ Add playlist</button>
+
+      <div class="add-playlist-panel" id="add-playlist-panel">
+        <div class="source-tabs">
+          <button type="button" class="source-tab active" data-tab="url">URL</button>
+          <button type="button" class="source-tab" data-tab="paste">Paste</button>
+        </div>
+        <div class="source-tab-panel active" id="tab-url">
+          <input class="source-input" type="url" id="custom-url-input" placeholder="https://example.com/playlist.m3u">
+          <button type="button" class="btn btn-sm" id="add-url-btn">Add URL</button>
+        </div>
+        <div class="source-tab-panel" id="tab-paste">
+          <textarea class="source-input source-textarea" id="custom-paste-input" placeholder="#EXTM3U&#10;#EXTINF:-1,Channel Name&#10;https://..."></textarea>
+          <button type="button" class="btn btn-sm" id="add-paste-btn">Add pasted M3U</button>
+        </div>
+      </div>
+
+      <div class="custom-sources" id="custom-sources"></div>
+
+      <button type="button" class="favorites-toggle" id="favorites-toggle">★ Favorites</button>
+      <input class="search-box" type="text" id="search" placeholder="Search channels…" autocomplete="off">
+    </div>
+    <div class="channel-list" id="channel-list">
+      <div class="empty-state">
+        <p>Loading playlist…</p>
+      </div>
+    </div>
+  </aside>
+
+  <main class="player-panel">
+    <div class="video-wrap">
+      <video id="video" controls playsinline></video>
+      <div class="video-placeholder" id="placeholder">
+        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/>
+          <path d="M17 2l-5 5-5-5"/>
+        </svg>
+        <p>SELECT A CHANNEL TO WATCH</p>
+      </div>
+    </div>
+    <div class="now-playing-bar">
+      <div class="now-playing-left">
+        <span class="live-pill" id="live-pill" style="display:none">● LIVE</span>
+        <div style="min-width:0">
+          <div class="np-title" id="np-title">No channel selected</div>
+          <div class="np-subtitle" id="np-subtitle">Pick a channel from the list</div>
+        </div>
+      </div>
+      <div class="np-right">
+        <button type="button" class="icon-btn" id="favorite-btn" style="display:none">★ Favorite</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="loading-overlay">
+  <div class="loader-bar"><div class="loader-bar-fill"></div></div>
+  <div class="loader-text" id="loader-text">LOADING PLAYLIST…</div>
+</div>
+
+<div id="toast"></div>
+
+<script src="app.js"></script>
+<script src="theme.js"></script>
+</body>
+</html>
