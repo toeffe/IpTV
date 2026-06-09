@@ -385,7 +385,7 @@
   .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
   .icon-btn.favorited { border-color: var(--accent-focus); color: var(--accent); }
 
-  .favorites-toggle {
+  .sidebar-toggle {
     width: 100%;
     background: transparent;
     border: 1px solid var(--border);
@@ -399,11 +399,15 @@
     text-align: left;
     transition: border-color .2s, color .2s, background .2s;
   }
-  .favorites-toggle:hover { border-color: var(--accent); color: var(--text); }
-  .favorites-toggle.active {
+  .sidebar-toggle:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+  .sidebar-toggle.active {
     background: var(--accent-subtle);
     border-color: var(--accent-focus);
     color: var(--accent);
+  }
+  .sidebar-toggle:disabled {
+    opacity: .45;
+    cursor: not-allowed;
   }
 
   .ch-fav-mark {
@@ -412,6 +416,15 @@
     flex-shrink: 0;
     line-height: 1;
   }
+  .ch-status {
+    font-family: var(--mono);
+    font-size: 9px;
+    flex-shrink: 0;
+    line-height: 1;
+    letter-spacing: .04em;
+  }
+  .ch-status.ok { color: var(--live); }
+  .ch-status.fail { color: var(--accent2); opacity: .7; }
 
   /* Loading */
   #loading-overlay {

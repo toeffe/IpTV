@@ -8,6 +8,15 @@ const LS_CUSTOM_SOURCES = 'iptv-custom-sources';
 const LS_BUILTIN_URL = 'iptv-builtin-url';
 const LS_PLAYLIST_MANIFEST = 'iptv-playlist-manifest';
 const LS_FAVORITES = 'iptv-favorites';
+const LS_STREAM_STATUS = 'iptv-stream-status';
+const STREAM_OK_TTL = 24 * 60 * 60 * 1000;
+const STREAM_FAIL_TTL = 7 * 24 * 60 * 60 * 1000;
+const MAX_STREAM_STATUS_ENTRIES = 25000;
+const CHECK_CONCURRENCY = 4;
+const MANIFEST_TIMEOUT_MS = 6000;
+const LEVEL_PROBE_MS = 4000;
+const BACKGROUND_BATCH_SIZE = 80;
+const BACKGROUND_PAUSE_MS = 40;
 const IPTV_BASE = 'https://iptv-org.github.io/iptv/';
 const GITHUB_API = 'https://api.github.com/repos/iptv-org/iptv/contents';
 const GITHUB_REF = 'gh-pages';
@@ -47,6 +56,10 @@ let customSources = [];
 let pasteCounter = 0;
 let favorites = [];
 let favoritesOnly = false;
+let streamStatus = {};
+let hideBroken = true;
+let availabilityChecking = false;
+let backgroundCheckActive = false;
 
 /* â”€â”€ FETCH â”€â”€ */
 async function fetchM3U(url) {
@@ -312,6 +325,276 @@ async function reloadAllChannels() {
 
   hideLoading();
   localStorage.setItem(LS_BUILTIN_URL, builtinUrl);
+  updateHideBrokenToggle();
+  startBackgroundCheck();
+}
+
+/* -- STREAM AVAILABILITY -- */
+function streamStatusTtl(status) {
+  return status === 'fail' ? STREAM_FAIL_TTL : STREAM_OK_TTL;
+}
+
+function loadStreamStatus() {
+  try {
+    const raw = localStorage.getItem(LS_STREAM_STATUS);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    const now = Date.now();
+    streamStatus = {};
+    for (const [url, entry] of Object.entries(data)) {
+      if (entry && entry.status && now - entry.checkedAt < streamStatusTtl(entry.status)) {
+        streamStatus[url] = entry;
+      }
+    }
+  } catch (_) {
+    streamStatus = {};
+  }
+}
+
+function pruneStreamStatus() {
+  const entries = Object.entries(streamStatus);
+  if (entries.length <= MAX_STREAM_STATUS_ENTRIES) return;
+  const sorted = entries.sort((a, b) => a[1].checkedAt - b[1].checkedAt);
+  const remove = entries.length - MAX_STREAM_STATUS_ENTRIES;
+  for (let i = 0; i < remove; i++) {
+    if (sorted[i][1].status === 'ok') delete streamStatus[sorted[i][0]];
+  }
+}
+
+function saveStreamStatus() {
+  pruneStreamStatus();
+  try {
+    localStorage.setItem(LS_STREAM_STATUS, JSON.stringify(streamStatus));
+  } catch (_) {}
+}
+
+function getStreamStatus(url) {
+  const entry = streamStatus[url];
+  if (!entry) return null;
+  if (Date.now() - entry.checkedAt >= streamStatusTtl(entry.status)) {
+    delete streamStatus[url];
+    return null;
+  }
+  return entry.status;
+}
+
+function setStreamStatus(url, status) {
+  if (!url || (status !== 'ok' && status !== 'fail')) return;
+  streamStatus[url] = { status, checkedAt: Date.now() };
+  saveStreamStatus();
+}
+
+function countBrokenInList(list) {
+  return list.filter(ch => getStreamStatus(ch.url) === 'fail').length;
+}
+
+function countUncheckedInList(list) {
+  return list.filter(ch => getStreamStatus(ch.url) === null).length;
+}
+
+function getChannelsToCheck() {
+  const q = document.getElementById('search').value.toLowerCase().trim();
+  let list = favoritesOnly ? [...favorites] : [...allChannels];
+  if (q) list = list.filter(ch => channelMatchesSearch(ch, q));
+  return list;
+}
+
+function getUncheckedChannels(list) {
+  return list.filter(ch => getStreamStatus(ch.url) === null);
+}
+
+function probeStream(url) {
+  return new Promise((resolve) => {
+    if (!url) {
+      resolve('fail');
+      return;
+    }
+
+    let finished = false;
+    let hls = null;
+    let manifestTimer = null;
+    let levelTimer = null;
+
+    const cleanup = () => {
+      clearTimeout(manifestTimer);
+      clearTimeout(levelTimer);
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+    };
+
+    const finish = (status) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve(status);
+    };
+
+    const beginLevelProbe = () => {
+      levelTimer = setTimeout(() => finish('fail'), LEVEL_PROBE_MS);
+      hls.startLoad(-1);
+    };
+
+    manifestTimer = setTimeout(() => finish('fail'), MANIFEST_TIMEOUT_MS);
+
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+      const probeVideo = document.createElement('video');
+      hls = new Hls({
+        enableWorker: true,
+        maxBufferLength: 2,
+        maxMaxBufferLength: 4,
+        autoStartLoad: false,
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        clearTimeout(manifestTimer);
+        beginLevelProbe();
+      });
+      hls.on(Hls.Events.LEVEL_LOADED, () => finish('ok'));
+      hls.on(Hls.Events.FRAG_LOADED, () => finish('ok'));
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) finish('fail');
+      });
+      hls.attachMedia(probeVideo);
+      hls.loadSource(url);
+      return;
+    }
+
+    if (/\.m3u8/i.test(url)) {
+      const probeVideo = document.createElement('video');
+      const nativeTimer = setTimeout(() => finish('fail'), MANIFEST_TIMEOUT_MS + LEVEL_PROBE_MS);
+      probeVideo.onloadedmetadata = () => {
+        clearTimeout(nativeTimer);
+        finish('ok');
+      };
+      probeVideo.onerror = () => {
+        clearTimeout(nativeTimer);
+        finish('fail');
+      };
+      probeVideo.src = url;
+      return;
+    }
+
+    finish('fail');
+  });
+}
+
+async function runAvailabilityCheck(targets, { background = false } = {}) {
+  if (!targets.length) return { ok: 0, fail: 0 };
+
+  availabilityChecking = true;
+  updateCheckAvailabilityButton(0, targets.length, background);
+
+  let ok = 0;
+  let fail = 0;
+  let index = 0;
+
+  async function worker() {
+    while (index < targets.length) {
+      const i = index++;
+      const ch = targets[i];
+      const status = await probeStream(ch.url);
+      setStreamStatus(ch.url, status);
+      if (status === 'ok') ok++;
+      else fail++;
+      updateCheckAvailabilityButton(i + 1, targets.length, background);
+      if ((i + 1) % 40 === 0) updateHideBrokenToggle();
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(CHECK_CONCURRENCY, targets.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  availabilityChecking = false;
+  updateCheckAvailabilityButton();
+  updateHideBrokenToggle();
+  applyChannelFilter();
+
+  return { ok, fail };
+}
+
+async function checkAvailability() {
+  if (availabilityChecking || !allChannels.length) return;
+
+  const scope = getChannelsToCheck();
+  const targets = getUncheckedChannels(scope);
+  if (!targets.length) {
+    showToast('All channels in this list are already checked.', false);
+    return;
+  }
+
+  backgroundCheckActive = false;
+  const { ok, fail } = await runAvailabilityCheck(targets);
+  const remaining = getUncheckedChannels(allChannels).length;
+  let msg = `Checked ${targets.length}: ${ok} working, ${fail} broken`;
+  if (remaining) msg += ` \u00b7 ${remaining.toLocaleString()} left`;
+  showToast(msg, false);
+
+  if (remaining) startBackgroundCheck();
+}
+
+async function startBackgroundCheck() {
+  if (backgroundCheckActive || availabilityChecking) return;
+  const remaining = getUncheckedChannels(allChannels);
+  if (!remaining.length) return;
+
+  backgroundCheckActive = true;
+  while (backgroundCheckActive && !availabilityChecking) {
+    const batch = getUncheckedChannels(allChannels).slice(0, BACKGROUND_BATCH_SIZE);
+    if (!batch.length) break;
+    await runAvailabilityCheck(batch, { background: true });
+    if (getUncheckedChannels(allChannels).length) {
+      await new Promise(r => setTimeout(r, BACKGROUND_PAUSE_MS));
+    }
+  }
+  backgroundCheckActive = false;
+  updateCheckAvailabilityButton();
+
+  const broken = countBrokenInList(allChannels);
+  const unchecked = countUncheckedInList(allChannels);
+  if (broken && !unchecked) {
+    showToast(`Scan complete: ${broken.toLocaleString()} broken streams hidden`, false);
+  }
+}
+
+function updateCheckAvailabilityButton(done, total, background) {
+  const btn = document.getElementById('check-availability-btn');
+  if (!btn) return;
+  if (availabilityChecking && total) {
+    const prefix = background ? 'Scanning' : 'Checking';
+    btn.textContent = `${prefix} ${done}/${total}\u2026`;
+    btn.disabled = true;
+  } else {
+    const unchecked = countUncheckedInList(allChannels);
+    btn.textContent = unchecked
+      ? `Check availability (${unchecked.toLocaleString()} left)`
+      : 'Check availability';
+    btn.disabled = !allChannels.length;
+  }
+}
+
+function updateHideBrokenToggle() {
+  const btn = document.getElementById('hide-broken-toggle');
+  if (!btn) return;
+  const base = favoritesOnly ? favorites : allChannels;
+  const brokenCount = countBrokenInList(base);
+  btn.textContent = brokenCount
+    ? `Hide broken (${brokenCount.toLocaleString()})`
+    : 'Hide broken';
+  btn.classList.toggle('active', hideBroken);
+}
+
+function toggleHideBroken() {
+  hideBroken = !hideBroken;
+  updateHideBrokenToggle();
+  applyChannelFilter();
+}
+
+function getFilterBase() {
+  return favoritesOnly ? favorites : allChannels;
 }
 
 
@@ -402,9 +685,12 @@ function channelMatchesSearch(ch, q) {
 
 function applyChannelFilter() {
   const q = document.getElementById('search').value.toLowerCase().trim();
-  const base = favoritesOnly ? favorites : allChannels;
-  filtered = q ? base.filter(ch => channelMatchesSearch(ch, q)) : [...base];
+  let list = getFilterBase();
+  if (q) list = list.filter(ch => channelMatchesSearch(ch, q));
+  if (hideBroken) list = list.filter(ch => getStreamStatus(ch.url) !== 'fail');
+  filtered = list;
   renderChannels();
+  updateHideBrokenToggle();
 }
 
 function toggleFavoritesView() {
@@ -416,7 +702,7 @@ function toggleFavoritesView() {
 /* â”€â”€ RENDER â”€â”€ */
 function renderChannelRow(ch, idx, mode) {
   const logoHtml = ch.logo
-    ? `<img class="ch-logo" src="${escHtml(ch.logo)}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="ch-logo-placeholder" style="display:none">${escHtml(ch.name.slice(0,2).toUpperCase())}</div>`
+    ? `<img class="ch-logo" src="${escHtml(ch.logo)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="ch-logo-placeholder" style="display:none">${escHtml(ch.name.slice(0,2).toUpperCase())}</div>`
     : `<div class="ch-logo-placeholder">${escHtml(ch.name.slice(0,2).toUpperCase())}</div>`;
   const tags = [ch.group, ch.country].filter(Boolean)
     .map(t => `<span class="ch-tag">${escHtml(t)}</span>`).join('');
@@ -424,6 +710,12 @@ function renderChannelRow(ch, idx, mode) {
     ? `<span class="ch-source">${escHtml(ch.sourceLabel)}</span>` : '';
   const favMark = !favoritesOnly && isFavorite(ch.url)
     ? '<span class="ch-fav-mark" aria-hidden="true">' + STAR + '</span>' : '';
+  const status = getStreamStatus(ch.url);
+  const statusMark = status === 'ok'
+    ? '<span class="ch-status ok" title="Working">\u2713</span>'
+    : status === 'fail'
+      ? '<span class="ch-status fail" title="Unavailable">\u2717</span>'
+      : '';
   const isActive = currentChannel && currentChannel.url === ch.url;
   const playFn = mode === 'favorites'
     ? `playFavorite(${idx})`
@@ -434,16 +726,21 @@ function renderChannelRow(ch, idx, mode) {
       <div class="ch-name">${escHtml(ch.name)}</div>
       <div class="ch-meta">${tags}${sourceTag}</div>
     </div>
-    ${favMark}
+    ${statusMark}${favMark}
   </div>`;
 }
 
 function renderChannels() {
   const el = document.getElementById('channel-list');
   if (!filtered.length) {
-    const msg = favoritesOnly
-      ? (favorites.length ? 'No favorites match your search.' : 'No favorites yet. Play a channel and tap ' + STAR + ' Favorite.')
-      : 'No channels found.';
+    let msg = 'No channels found.';
+    if (hideBroken && countBrokenInList(getFilterBase()) > 0) {
+      msg = 'All matching channels are marked broken. Turn off Hide broken to see them.';
+    } else if (favoritesOnly) {
+      msg = favorites.length
+        ? 'No favorites match your search.'
+        : 'No favorites yet. Play a channel and tap ' + STAR + ' Favorite.';
+    }
     el.innerHTML = `<div class="empty-state"><p>${msg}</p></div>`;
     return;
   }
@@ -503,12 +800,29 @@ function startStream(url) {
     currentHls = hls;
     hls.loadSource(url);
     hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      setStreamStatus(url, 'ok');
+      updateHideBrokenToggle();
+      video.play().catch(() => {});
+    });
     hls.on(Hls.Events.ERROR, (e, data) => {
-      if (data.fatal) showToast('Stream unavailable or blocked. Try another channel.', true);
+      if (!data.fatal) return;
+      setStreamStatus(url, 'fail');
+      updateHideBrokenToggle();
+      applyChannelFilter();
+      showToast('Stream unavailable. Try another channel.', true);
     });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = url;
+    video.onloadeddata = () => {
+      setStreamStatus(url, 'ok');
+      updateHideBrokenToggle();
+    };
+    video.onerror = () => {
+      setStreamStatus(url, 'fail');
+      updateHideBrokenToggle();
+      applyChannelFilter();
+    };
     video.play().catch(() => {});
   } else {
     video.src = url;
@@ -581,6 +895,8 @@ document.querySelectorAll('.source-tab').forEach(tab => {
 document.getElementById('source-select').addEventListener('change', reloadAllChannels);
 document.getElementById('favorite-btn').addEventListener('click', toggleFavorite);
 document.getElementById('favorites-toggle').addEventListener('click', toggleFavoritesView);
+document.getElementById('check-availability-btn').addEventListener('click', checkAvailability);
+document.getElementById('hide-broken-toggle').addEventListener('click', toggleHideBroken);
 
 /* â”€â”€ IPTV-ORG PLAYLIST INDEX (GitHub API) â”€â”€ */
 function formatSlug(filename) {
@@ -720,8 +1036,11 @@ async function populateBuiltinSelect() {
 
 /* â”€â”€ BOOT â”€â”€ */
 window.addEventListener('DOMContentLoaded', async () => {
+  loadStreamStatus();
   loadFavorites();
   updateFavoritesToggle();
+  updateCheckAvailabilityButton();
+  updateHideBrokenToggle();
   loadCustomSources();
   renderCustomSourceList();
   await populateBuiltinSelect();
